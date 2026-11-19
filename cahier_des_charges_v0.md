@@ -6,6 +6,7 @@
 > Historique :
 > - V0 : première proposition.
 > - V0.1 : caméra = ESP32-CAM existant (surveillance seule) ; laser 5 W optique pour découpe de contreplaqué ; stratégie « PCB final + firmware de démonstration » ; ajout des données du manuel MKS DLC32 V2.
+> - V0.2 : électronique conçue librement (DLC32 = simple référence) ; c'est le firmware open source qu'on adapte (fichier machine + code personnalisé Grbl_Esp32) ; liste des 7 contraintes de compatibilité.
 
 ---
 
@@ -65,21 +66,53 @@ La page web du téléphone, servie par l'ESP principal, affiche simplement l'ima
 
 Point de vigilance : l'ESP32-CAM a très peu de broches libres (la plupart sont prises par la caméra et la SD). Il faut identifier les 2 broches de l'UART **[À VÉRIFIER]**. La SD de l'ESP32-CAM ne sera pas utilisée : on garde la SD de la carte principale.
 
-### 2.2 Compatibilité du brochage avec la DLC32 — **recommandé, [À DÉCIDER]**
-Comme le PCB est le matériel final, je recommande de **reprendre le brochage ESP32 de la MKS DLC32 V2.1** pour toutes les fonctions qu'elle possède :
-- moteurs via I2S + 74HC595 ;
-- fins de course, laser, carte SD ;
-- écran EXP1/EXP2 compatible **TS35** ;
-- I2C, buzzer.
+### 2.2 Conception électronique libre + firmware open source adapté — **DÉCIDÉ**
+La DLC32 n'est qu'une **référence fonctionnelle**. On conçoit notre propre électronique (brochage, choix des composants, architecture) et **c'est le firmware open source qu'on adapte à notre carte**, pas l'inverse.
 
-Nos fonctions en plus (LEDs, pompe, caméra, interlock, mesure d'énergie) vont sur les broches et sorties restantes.
+C'est possible simplement avec Grbl_Esp32 (vérifié dans le code présent dans `Grbl_Esp32-main/`) :
 
-Bénéfices :
-- **Phase 2 quasi immédiate** : le firmware MKS DLC32 (dérivé open source de Grbl_Esp32, avec interface écran TS35 et compatible LaserGRBL) devrait tourner directement sur notre carte **[À VÉRIFIER : sources publiées sur github.com/makerbase-mks]**. Même chose pour Grbl_Esp32/FluidNC, qui ont des configurations DLC32.
-- C'est exactement « l'open source facile à implémenter » qui vous a plu dans la vidéo.
-- L'écran **TS35** se branche tel quel (2 nappes HE10), sans conception d'écran.
+| Ce qu'on adapte | Où / comment | Effort |
+|---|---|---|
+| **Brochage** (step/dir, fins de course, laser, SD, sondes…) | Un fichier de définition machine `src/Machines/notre_carte.h` : une ligne `#define X_STEP_PIN GPIO_NUM_xx` par signal (voir `mpcnc_laser_module_v1p2.h`, ~40 lignes) | Faible |
+| **Pas/mm, vitesses, accélérations, courses, micro-pas** | Paramètres `$100`, `$110`, `$120`, `$130`…, modifiables **sans recompiler**, même depuis LaserGRBL. Valeurs par défaut dans le fichier machine (`DEFAULT_X_STEPS_PER_MM`…) | Nul |
+| **Drivers TMC2209 en UART** (courant réglé par logiciel) | Pris en charge (`TrinamicUartDriver`, exemple `TMC2209_4x.h`) | Faible |
+| **Notre écran, LEDs, caméra, mesure d'énergie, sécurité** | Points d'extension prévus par Grbl_Esp32 : `machine_init()`, `display_init()` (exemple `Custom/oled_basic.cpp` : une tâche FreeRTOS qui lit l'état de Grbl et l'affiche), `user_defined_macro()`, `user_m30()`… déclarés via `CUSTOM_CODE_FILENAME` / `DISPLAY_CODE_FILENAME` | Moyen — **c'est là que nos blocs de phase 1 viennent se brancher** |
 
-Action : récupérer le **schéma électrique DLC32 V2.1** (dépôt GitHub Makerbase) et le fichier de brochage des firmwares, puis faire le bilan des broches libres.
+Remarque : Grbl_Esp32 est archivé au profit de **FluidNC**, où le brochage se décrit dans un fichier YAML sans recompiler. FluidNC est moins pratique pour greffer du code personnel **[À VÉRIFIER]**. Le choix Grbl_Esp32 / FluidNC se fera en phase 2.
+
+**Les vraies contraintes de compatibilité** (ce que le PCB doit respecter, et rien d'autre).
+Niveau de preuve :
+- **Grbl_Esp32** : vérifié dans le code local.
+- **FluidNC** : seulement en partie (documentation communautaire et notes de version ; le wiki officiel n'était pas joignable).
+
+On retient l'**intersection des deux**, c'est-à-dire le choix le plus prudent, qui laisse les deux firmwares possibles.
+1. **µC = ESP32 classique** (WROOM-32E).
+   - Grbl_Esp32 : ESP32 classique uniquement.
+   - FluidNC : l'ESP32-S3 est pris en charge depuis la pré-version v4.0.0. Le fonctionnement des moteurs sur S3 n'est pas documenté.
+   - → L'ESP32 classique est le seul choix compatible avec les deux.
+2. **STEP/DIR des moteurs** sur des **GPIO directs** *ou* sur une chaîne de **74HC595 pilotée par l'I2S** (`I2S_OUT_BCK/WS/DATA`). Pas d'expandeur I2C/SPI pour les pas (trop lent, non pris en charge).
+   - FluidNC : modes de pas RMT et TIMED (GPIO natifs), I2SO_STATIC et I2SO_STREAM (matériel I2S externe) → compatible.
+   - FluidNC accepte en plus des **extensions d'E/S lentes** (ex. carte « Airedale » reliée en UART) **[À VÉRIFIER pour I2C/PCA95xx]**.
+   - Contraintes 3 à 7 : non vérifiées pour FluidNC **[À VÉRIFIER]**.
+3. **Drivers** : step/dir standard (A4988, TMC2209 autonome) ou **TMC2209 en UART** / TMC2130-5160 en SPI.
+4. **Laser** sur une sortie GPIO capable de PWM (toutes les sorties de l'ESP32 le sont via LEDC), hors broches de strapping.
+5. **Carte SD sur bus SPI** (broche CS configurable).
+6. **Fins de course / flamme / arrêt d'urgence** sur des entrées GPIO (34–39 utilisables, avec pull-up externe).
+7. Une **liaison USB-série sur l'UART0** (GPIO1/3) pour LaserGRBL en filaire.
+
+Tout le reste est **libre et à concevoir par nous** : alimentation et protections, étages de puissance, choix et brochage de l'écran, gestion des sorties lentes (pompe, LEDs, buzzer, alim caméra), mesure d'énergie, sécurité matérielle, connectique, placement-routage.
+
+Libertés de conception par rapport à la DLC32 (exemples à trancher en revue de schéma) :
+| Fonction | DLC32 | Nous (proposition) |
+|---|---|---|
+| Drivers | TMC2209 autonomes, micro-pas par DIP | **TMC2209 en UART** : courant et micro-pas réglés par logiciel, diagnostic, homing sans capteur possible |
+| Écran | TS35 imposé (EXP1/EXP2) | **Écran choisi par nous** (ex. 3,5" ILI9488 SPI + tactile capacitif FT6236 en I2C) et notre propre IHM |
+| Sorties lentes | Sur 74HC595 | 74HC595 en I2S *ou* expandeur I2C (PCA9555) **[À DÉCIDER selon le bilan GPIO]** |
+| Sécurité | Entrée « probe » = flamme | Interlock capot + E-stop matériels coupant le laser, flamme analogique |
+| Mesure | — | INA226 |
+| Caméra | — | Alimentation commutée + UART vers ESP32-CAM |
+
+Action suivante : faire le **bilan GPIO** de notre propre carte (table de brochage) en respectant les 7 contraintes.
 
 ### 2.3 Stratégie firmware de cours (phase 1)
 Le code est organisé en **deux couches** :
@@ -108,7 +141,9 @@ Ce qui sera **réutilisé en phase 2** (soyons honnêtes) :
 | Mesure d'énergie + gestion de veille | Oui (absent des firmwares open source) |
 | Pilotage caméra, LEDs, pompe | Oui |
 | Interface web téléphone (page + caméra) | Oui, en partie (adaptable à l'API du firmware open source) |
-| Interface tactile | Probablement non si le firmware MKS est repris (il a déjà la sienne) |
+| Interface tactile (IHM écran) | **Oui** : branchée sur `display_init()` de Grbl_Esp32 ; elle lit l'état machine et envoie des commandes au lieu d'appeler nos pilotes |
+
+Règle de conception pour que ce soit vrai : **l'IHM et l'interface web ne parlent jamais directement aux moteurs ou au laser**. Elles passent par une interface « contrôleur machine » (ex. `machine_jog()`, `machine_get_state()`). En phase 1, cette interface est notre code de démo ; en phase 2, elle appelle Grbl.
 
 Ce que vous écrivez vous-mêmes reste largement suffisant pour être évalué sur le code. Utiliser des bibliothèques (LVGL ou TFT_eSPI, FATFS, serveur web) reste votre code applicatif. Le cours a d'ailleurs comme objectif explicite de « s'approprier et réutiliser du code existant ».
 
@@ -166,12 +201,14 @@ Framework : **Arduino-ESP32 sous PlatformIO** (même environnement que Grbl_Esp3
                                                            ├─► MOSFET (PWM) ─► LEDs éclairage
                                                            ├─► INA226 (mesure U/I, I2C)
                                                            └─► Buck 24→5 V 3 A ─┬─► LDO/Buck 3,3 V ─► ESP32, logique
-                                                                                ├─► Écran TS35 (EXP1/EXP2)
+                                                                                ├─► Écran tactile 3,5" (choix §4.3)
                                                                                 └─► MOSFET ─► ESP32-CAM (5 V)
 ESP32-WROOM-32E
-  ├─ I2S → 74HC595 ×2 → STEP/DIR/EN X,Y,Z + sorties lentes (pompe, buzzer, alim caméra…)   [comme DLC32]
-  ├─ SPI → EXP1/EXP2 (écran TS35 + tactile)  |  SPI → micro-SD                               [comme DLC32]
-  ├─ Entrées → fins de course X/Y/Z, capteur flamme (port « probe » DLC32), interlock capot
+  ├─ STEP/DIR X,Y,Z : GPIO directs ou 74HC595 en I2S (contrainte firmware n°2)
+  ├─ UART → TMC2209 ×3 (adressés)
+  ├─ Sorties lentes (pompe, buzzer, alim caméra) : 74HC595 ou PCA9555 [À DÉCIDER]
+  ├─ SPI → écran + micro-SD (CS séparés)  |  tactile : SPI ou I2C [À DÉCIDER]
+  ├─ Entrées → fins de course X/Y/Z, capteur flamme, interlock capot, E-stop
   ├─ PWM → laser TTL (buffer 5 V + pull-down), LEDs
   ├─ I2C → INA226 (+ extension)
   ├─ UART → ESP32-CAM (commandes)
@@ -180,7 +217,7 @@ Arrêt d'urgence : coupe matériellement l'alimentation du laser + entrée lue p
 ESP32-CAM (module existant) ── Wi-Fi ──► téléphone (flux MJPEG)
 ```
 
-### 4.2 Données reprises du manuel MKS DLC32 V2
+### 4.2 Données du manuel MKS DLC32 V2 (référence, pas un modèle à copier)
 | Élément DLC32 | Valeur | Ce qu'on en fait |
 |---|---|---|
 | Alimentation | 12–24 V, 5 A max, fusible 10 A, jack DC 2,1 mm | **24 V** ; bornier à vis ou XT30 plutôt qu'un jack (un jack 5 A est juste) ; fusible dimensionné au §6.2 |
@@ -201,9 +238,9 @@ Le manuel ne contient **pas le schéma** : il faut récupérer celui publié par
 ### 4.3 Choix composants (proposition)
 | Bloc | Choix | Justification |
 |---|---|---|
-| Drivers | Supports stepstick + TMC2209 (micro-pas par DIP) | Remplaçables en proto, silencieux, identiques à la machine de la vidéo |
-| Extension de sorties | 74HC595 ×2 via I2S | Économise les GPIO, géré nativement par les firmwares phase 2 |
-| Écran | MKS TS35 sur EXP1/EXP2 | Pas d'écran à concevoir ; compatible avec le firmware MKS |
+| Drivers | Supports stepstick + **TMC2209 en UART** | Remplaçables en proto, silencieux, réglage logiciel ; pris en charge par Grbl_Esp32 |
+| Extension de sorties | 74HC595 via I2S **ou** PCA9555 en I2C **[À DÉCIDER]** | Selon le bilan GPIO (§2.2) |
+| Écran | Écran SPI 3,5" (ILI9488) + tactile **[À DÉCIDER : résistif XPT2046 sur SPI ou capacitif FT6236 sur I2C]** | Choisi et intégré par nous ; IHM maison réutilisable en phase 2 |
 | Pompe / LEDs / alim caméra | MOSFET N logique (AO3400 ou équivalent) + diode de roue libre pour la pompe | Standard, robuste |
 | Sortie laser | Buffer 5 V (74AHCT1G125 ou transistor) + pull-down | Le module attend 0–5 V ; état bas garanti au démarrage |
 | Mesure d'énergie | INA226 + shunt sur le 24 V | Capteur numérique → « interfacer des capteurs » + preuve de sobriété |
@@ -319,7 +356,7 @@ Alternatives écartées :
 |---|---|
 | Imprimante 3D d'occasion | 0–80 € |
 | Module laser 5 W optique | 40–90 € |
-| Écran MKS TS35 | 15–25 € |
+| Écran 3,5" SPI tactile | 10–20 € |
 | ESP32-CAM | déjà en stock |
 | PCB ×5 + composants | 30–60 € |
 | TMC2209 ×3 | 10–15 € |
@@ -333,7 +370,7 @@ Alternatives écartées :
 1. Durée du projet, nombre de séances, date de rendu ?
 2. Binôme accepté par les encadrants ?
 3. Modèle exact de l'imprimante récupérée ?
-4. Compatibilité du brochage avec la DLC32 (§2.2) : OK ?
+4. Sorties lentes : 74HC595 en I2S ou expandeur I2C ? Tactile résistif ou capacitif ? (§2.2, après le bilan GPIO)
 5. Arduino/PlatformIO ou ESP-IDF : contrainte du cours ?
 6. Assemblage PCB manuel ou externe ? 2 ou 4 couches ?
 7. Connecteur laser 2 broches (12–24 V PWM) en plus du TTL : utile ?
