@@ -62,9 +62,31 @@ Intégration sur notre PCB (l'ESP32-CAM n'est pas soudé : il est enfiché ou re
 | UART (2 fils) ESP principal ↔ ESP32-CAM | Commandes : marche/arrêt du flux, LED flash, état, adresse IP |
 | GND commun | — |
 
-La page web du téléphone, servie par l'ESP principal, affiche simplement l'image venant de l'adresse de l'ESP32-CAM (`<img src="http://<ip-cam>:81/stream">`).
+**Une seule page sur le téléphone — DÉCIDÉ : servie par l'ESP principal.**
+La page (widgets de commande + état des capteurs + vidéo) est servie par l'ESP principal. La vidéo y est intégrée par une simple balise `<img src="http://<ip-cam>:81/stream">` : c'est **le navigateur du téléphone** qui va chercher le flux directement chez l'ESP32-CAM. Les deux ESP n'échangent jamais la vidéo entre eux. Une balise `<img>` peut afficher une image venant d'une autre adresse sans configuration particulière (pas de blocage CORS pour une image).
 
-Point de vigilance : l'ESP32-CAM a très peu de broches libres (la plupart sont prises par la caméra et la SD). Il faut identifier les 2 broches de l'UART **[À VÉRIFIER]**. La SD de l'ESP32-CAM ne sera pas utilisée : on garde la SD de la carte principale.
+Pourquoi pas l'inverse (page servie par l'ESP32-CAM, qui relaierait les ordres en UART) :
+- la commande de la machine dépendrait de la caméra : caméra coupée ou plantée = plus d'interface. Or on veut justement pouvoir couper la caméra pour économiser l'énergie ;
+- l'ESP32-CAM est déjà le plus chargé (compression JPEG + envoi du flux) ;
+- les ordres feraient un détour Wi-Fi → ESP32-CAM → UART → ESP principal : plus de latence, un point de panne de plus, et le contrôleur machine ne serait plus maître de sa propre interface.
+
+**Scénario d'allumage de la caméra :**
+1. Le téléphone affiche la page de l'ESP principal (caméra éteinte, 0 mA).
+2. L'utilisateur appuie sur « Caméra » → message WebSocket `{"cmd":"cam","on":true}`.
+3. L'ESP principal ferme le MOSFET d'alimentation 5 V de l'ESP32-CAM.
+4. L'ESP32-CAM démarre et se connecte au réseau Wi-Fi (voir §5), en **client**. Elle lance son serveur de flux.
+5. L'ESP32-CAM envoie « prête + son adresse IP » à l'ESP principal par l'UART.
+6. L'ESP principal transmet l'adresse à la page par WebSocket ; la page insère la balise `<img>`. Durée attendue : quelques secondes **[À MESURER]**.
+7. Arrêt : bouton « Caméra off », fermeture de la page, ou délai d'inactivité → l'ESP principal coupe le MOSFET.
+
+Rôle exact de l'UART (pas de vidéo dessus) : signalisation seulement. Adresse IP de la caméra, « je suis prête », état, LED flash, résolution. Elle permet à l'ESP principal de savoir que la caméra fonctionne **sans dépendre du Wi-Fi**. Avec le mode client retenu (§5), l'UART est **indispensable** : l'adresse IP de la caméra n'est pas connue d'avance, et c'est aussi par l'UART que l'ESP principal donne à la caméra le nom et le mot de passe du réseau.
+
+Points de vigilance électriques :
+- **Alimentation fantôme** : quand l'ESP32-CAM est coupée, la broche TX de l'ESP principal (au niveau haut au repos) l'alimente partiellement par ses diodes de protection internes. Il faut une résistance série (~1 kΩ) sur chaque fil UART **et** passer la broche TX en entrée quand la caméra est coupée.
+- **Commutation côté +5 V** (interrupteur « high-side » : MOSFET P ou load switch), pas côté masse. Couper la masse d'une carte reliée par l'UART ferait circuler le courant de retour par les fils de données.
+- Pics de courant de l'ESP32-CAM au démarrage du Wi-Fi : condensateur local de quelques centaines de µF côté caméra **[À VÉRIFIER sur datasheet]**.
+- L'ESP32-CAM a très peu de broches libres (la plupart sont prises par la caméra et la SD). Il faut identifier les 2 broches de l'UART **[À VÉRIFIER]**. La SD de l'ESP32-CAM ne sera pas utilisée : on garde la SD de la carte principale.
+- L'exemple `CameraWebServer` ne sert en pratique le flux qu'à **un seul spectateur à la fois** **[À VÉRIFIER]**. Ça suffit pour la surveillance depuis un téléphone.
 
 ### 2.2 Conception électronique libre + firmware open source adapté — **DÉCIDÉ**
 La DLC32 n'est qu'une **référence fonctionnelle**. On conçoit notre propre électronique (brochage, choix des composants, architecture) et **c'est le firmware open source qu'on adapte à notre carte**, pas l'inverse.
@@ -108,7 +130,7 @@ Libertés de conception par rapport à la DLC32 (exemples à trancher en revue d
 | Drivers | TMC2209 autonomes, micro-pas par DIP | **TMC2209 en UART** : courant et micro-pas réglés par logiciel, diagnostic, homing sans capteur possible |
 | Écran | TS35 imposé (EXP1/EXP2) | **Écran choisi par nous** (ex. 3,5" ILI9488 SPI + tactile capacitif FT6236 en I2C) et notre propre IHM |
 | Sorties lentes | Sur 74HC595 | 74HC595 en I2S *ou* expandeur I2C (PCA9555) **[À DÉCIDER selon le bilan GPIO]** |
-| Sécurité | Entrée « probe » = flamme | Interlock capot + E-stop matériels coupant le laser, flamme analogique |
+| Sécurité | Entrée « probe » = flamme | Chaîne clé + arrêt d'urgence + réarmement (relais) coupant le laser, flamme analogique |
 | Mesure | — | INA226 |
 | Caméra | — | Alimentation commutée + UART vers ESP32-CAM |
 
@@ -119,7 +141,7 @@ Le code est organisé en **deux couches** :
 1. **Blocs pilotes (HAL)**, un par périphérique, chacun avec son programme de test :
    - moteurs, laser, pompe, LEDs ;
    - écran + tactile, SD ;
-   - capteurs (flamme, interlock, fins de course, INA226) ;
+   - capteurs (flamme, chaîne de sécurité OK, fins de course, INA226) ;
    - liaison avec l'ESP32-CAM ;
    - Wi-Fi.
 
@@ -137,7 +159,7 @@ Ce qui sera **réutilisé en phase 2** (soyons honnêtes) :
 | Bloc | Réutilisé ? |
 |---|---|
 | Moteurs, laser, SD, Wi-Fi de base | Non : le firmware open source les gère déjà. Ils auront servi à valider le PCB. |
-| Supervision sécurité (flamme, interlock, watchdog) | Oui, en complément |
+| Supervision sécurité (flamme, chaîne de sécurité, watchdog) | Oui, en complément |
 | Mesure d'énergie + gestion de veille | Oui (absent des firmwares open source) |
 | Pilotage caméra, LEDs, pompe | Oui |
 | Interface web téléphone (page + caméra) | Oui, en partie (adaptable à l'API du firmware open source) |
@@ -183,7 +205,7 @@ Framework : **Arduino-ESP32 sous PlatformIO** (même environnement que Grbl_Esp3
 | F9 | Afficher la caméra de surveillance sur le téléphone | M | ≥ 5 img/s en VGA, latence < 1 s |
 | F10 | Allumer/éteindre la caméra à distance (économie d'énergie) | S | Conso caméra = 0 mA quand coupée |
 | F11 | Mesurer la consommation (tension/courant 24 V) | S | ±5 % vs multimètre ; affichée à l'écran et sur le téléphone |
-| F12 | Détection flamme / ouverture capot → arrêt laser | M (sécurité) | Coupure < 100 ms |
+| F12 | Détection flamme → arrêt laser ; arrêt d'urgence → coupure matérielle du laser avec réarmement | M (sécurité) | Coupure < 100 ms ; pas de redémarrage au déverrouillage de l'AU |
 | F13 | Mode veille économe | M (cours) | Conso en veille mesurée et documentée |
 | F14 | Tracé démo (carré, cercle) depuis l'écran ou le téléphone | S | Tracé visible au crayon ou au laser basse puissance |
 | F15 | Upload d'un fichier vers la SD depuis le téléphone | C | Fichier de 1 Mo transféré |
@@ -208,12 +230,12 @@ ESP32-WROOM-32E
   ├─ UART → TMC2209 ×3 (adressés)
   ├─ Sorties lentes (pompe, buzzer, alim caméra) : 74HC595 ou PCA9555 [À DÉCIDER]
   ├─ SPI → écran + micro-SD (CS séparés)  |  tactile : SPI ou I2C [À DÉCIDER]
-  ├─ Entrées → fins de course X/Y/Z, capteur flamme, interlock capot, E-stop
+  ├─ Entrées → fins de course X/Y/Z, capteur flamme, « chaîne de sécurité OK »
   ├─ PWM → laser TTL (buffer 5 V + pull-down), LEDs
   ├─ I2C → INA226 (+ extension)
   ├─ UART → ESP32-CAM (commandes)
   └─ USB (CH340 + reset auto) + HE10 8 pts (format ESEO) pour la programmation
-Arrêt d'urgence : coupe matériellement l'alimentation du laser + entrée lue par l'ESP32
+Chaîne de sécurité (clé + arrêt d'urgence + réarmement → relais K1) : coupe matériellement le laser et la pompe, force le TTL laser à 0 et les drivers en désactivé, informe l'ESP32 (§6.1)
 ESP32-CAM (module existant) ── Wi-Fi ──► téléphone (flux MJPEG)
 ```
 
@@ -268,12 +290,33 @@ Le manuel ne contient **pas le schéma** : il faut récupérer celui publié par
 
 | Aspect | Proposition |
 |---|---|
-| Mode réseau | **Point d'accès (AP) créé par la graveuse** : marche partout, y compris en salle de TP sans réseau. L'ESP32-CAM s'y connecte. Option : mode client (STA) sur la box. |
-| Accès | `http://graveuse.local` (mDNS) ou IP fixe 192.168.4.1 |
+| Mode réseau | **DÉCIDÉ : mode client (STA)** : les deux ESP rejoignent un réseau existant (box ou partage de connexion du téléphone). Point d'accès (AP) seulement pour la première configuration et en secours. Détails ci-dessous. |
+| Accès | `http://graveuse.local` (mDNS) **[À VÉRIFIER sur Android]**, sinon adresse IP affichée sur l'écran tactile |
 | Interface | **Page web servie par l'ESP32** → rien à installer, Android + iOS |
 | Commandes + état temps réel | **WebSocket** (explication ci-dessous) avec messages JSON |
 | Vidéo | Flux MJPEG direct depuis l'ESP32-CAM |
-| Sécurité | AP protégé WPA2 + mot de passe d'accès à l'interface |
+| Sécurité | Réseau WPA2 + mot de passe d'accès à l'interface ; AP de configuration protégé par mot de passe |
+
+**Choix du mode réseau — DÉCIDÉ : B (mode client).**
+
+| | A. L'ESP principal crée le réseau (AP) | B. Les deux ESP rejoignent un réseau existant (STA) : box ou partage de connexion du téléphone |
+|---|---|---|
+| Le téléphone garde Internet | **Non** (il est connecté à un réseau sans Internet ; Android/iOS peuvent même s'en déconnecter tout seuls) | **Oui** (par la box, ou par les données mobiles en partage de connexion) |
+| Marche sans box (salle de TP, atelier) | Oui | Oui avec le partage de connexion du téléphone |
+| Chemin de la vidéo | Caméra → **radio de l'ESP principal** → téléphone : en Wi-Fi, tout le trafic d'un point d'accès passe par lui. La vidéo occupe la radio et le cœur 0 de l'ESP principal | Caméra → box/téléphone → téléphone : **l'ESP principal n'est pas traversé** |
+| Risque sur la gravure | Faible si la génération des pas est matérielle (RMT/I2S) sur le cœur 1, mais à **mesurer** (gigue des pas avec flux actif) | Aucun |
+| Adresses IP | Connues d'avance (192.168.4.x) | Inconnues → la caméra les communique par l'UART (§2.1) |
+| Configuration | Aucune | Saisir le nom et le mot de passe du réseau (page de configuration) |
+
+Raisons du choix B : le téléphone **garde son accès à Internet** pendant l'utilisation, et la vidéo ne traverse plus l'ESP principal (aucun risque sur la génération des pas).
+
+Conséquences à traiter :
+1. **Première configuration (ou réseau introuvable)** : l'ESP principal ouvre un point d'accès de configuration (« Graveuse-Setup ») avec une page de saisie du nom du réseau et du mot de passe, enregistrés en mémoire flash. Principe classique (bibliothèque type WiFiManager). On peut aussi saisir le réseau sur l'écran tactile.
+2. **L'ESP32-CAM n'est configurée nulle part** : l'ESP principal lui transmet le nom et le mot de passe du réseau **par l'UART** à chaque démarrage. Un seul point de configuration, et l'UART est pleinement justifiée.
+3. **Trouver l'ESP principal depuis le téléphone** (adresse IP attribuée par la box, donc inconnue) : nom `graveuse.local` (mDNS : fonctionne sur iOS et PC, support Android variable **[À VÉRIFIER]**). En secours, l'adresse IP s'affiche sur l'écran tactile. Sur une box, on peut aussi réserver une adresse fixe.
+4. **Trouver la caméra** : elle envoie son adresse IP à l'ESP principal par l'UART, qui la transmet à la page (§2.1).
+5. **Réseau de l'école** : un réseau d'entreprise (type eduroam, identifiant + mot de passe personnels) est difficile à utiliser depuis un ESP32, et ces réseaux isolent souvent les appareils entre eux. Le téléphone ne pourrait alors pas joindre la graveuse. **En TP et en soutenance, on utilise le partage de connexion du téléphone.** **[À VÉRIFIER : le téléphone joint bien les appareils connectés à son propre partage, Android et iOS]**
+6. **Secours** : si aucun réseau connu n'est trouvé après ~20 s, retour au point d'accès de configuration. La graveuse reste toujours pilotable.
 
 **Le WebSocket en bref.**
 - En HTTP classique, le téléphone pose une question, l'ESP répond, et la connexion se ferme. Pour afficher la position en direct, il faudrait reposer la question 10 fois par seconde.
@@ -293,13 +336,49 @@ Alternatives écartées :
 ## 6. Exigences non fonctionnelles
 
 ### 6.1 Sécurité laser — non négociable
-- **Arrêt d'urgence matériel** coupant l'alimentation du laser (pas seulement un GPIO).
-- **Interlock capot** en série dans la commande laser + lu par l'ESP32.
+- **Machine ouverte, sans capot — DÉCIDÉ.** Conséquences : le faisceau réfléchi ou diffusé est dangereux pour les yeux dans toute la pièce, donc **lunettes adaptées obligatoires pour toute personne présente**. Écran de protection orange autour de la tête laser recommandé. Pas de tir réel en salle de TP.
+- **Chaîne de sécurité matérielle — [À DÉCIDER]** (discussion reportée le 2026-11-20, après lecture de documentation).
+  - Acquis : bouton AU à 2 contacts NF ; aucune reprise au simple déverrouillage (EN ISO 13850) ; l'ESP32 informe mais n'est pas la barrière de sécurité.
+  - Variantes candidates :
+    - **V5** : relais K1 à auto-maintien + bouton de réarmement, deux voies (schéma ci-dessous) ;
+    - **V6** : contact AU 1 en coupure directe de l'alimentation laser + bascule (74LVC1G74) sur le /OE du buffer TTL + porte ET « PWM = 0 », réarmement depuis l'écran ;
+    - **V7** : comme V6 sans la porte ET. Le dialogue « Réarmer ? » de l'écran envoie l'impulsion qui libère la bascule ; un ESP32 figé ne peut pas réarmer.
+  - Schéma d'exemple (V5) :
+  ```
+  24 V ──[Clé]──[AU contact NF 1]──[Verrou. distant (cavalier)]──┬──[Réarmement NO]──┬── bobine relais K1 ── GND
+                                                                 └───[contact K1]────┘   (auto-maintien)
+  Voie 1 (puissance) : contact K1 ──► alimentation laser + pompe d'air assist
+                       sortie K1  ──► pont diviseur ──► entrée « puissance laser présente » de l'ESP32 ; désactivation des drivers (EN)
+
+  Voie 2 (commande, indépendante du relais) :
+  5 V ──[R pull-up]──┬──[AU contact NF 2]── GND        (AU enfoncé → contact ouvert → niveau haut)
+                     ├──► /OE du buffer TTL laser (74AHCT1G125) → sortie en haute impédance → pull-down → TTL = 0
+                     └──► entrée « AU enfoncé » de l'ESP32 (via adaptation 3,3 V)
+  ```
+  - **Arrêt d'urgence** : bouton coup de poing Ø 22 mm à accrochage, **2 contacts NF** (ex. S208-031, 10 A 400 V AC). Contact 1 → voie 1 (relais), contact 2 → voie 2 (blocage du signal TTL).
+  - **Pourquoi deux voies** (redondance + diversité) : chaque voie couvre une panne que l'autre ne voit pas.
+    - *Contacts du relais soudés* (appel de courant des condensateurs du driver laser) : la voie 1 ne coupe plus rien, et l'ESP32 lit toujours « puissance présente ». Seule la voie 2, qui ne passe pas par le relais, arrête le faisceau.
+    - *Condensateurs internes du module laser* : après ouverture du relais, ils peuvent alimenter la diode quelques ms à quelques centaines de ms **[À MESURER]**. La voie 2 coupe le TTL instantanément.
+    - *ESP32 planté, firmware buggé ou en cours de flashage* : le PWM est généré par un périphérique matériel (LEDC) qui **continue à tourner même si le processeur est bloqué**. La surveillance logicielle par le pont diviseur ne sert alors à rien. En phase 2, le firmware est en plus un code open source que nous ne maîtrisons pas entièrement.
+    - *Broche TTL court-circuitée au niveau haut* : la voie 1 coupe l'alimentation du laser.
+  - **Coût de la voie 2 : quasi nul.** Le buffer 5 V du TTL est déjà prévu (§4.3) et le 74AHCT1G125 possède une entrée de validation /OE. On l'utilise au lieu d'ajouter une porte ET.
+  - La surveillance par l'ESP32 reste utile, mais pour **l'information** (arrêter le travail, PWM à 0, alerte au téléphone, prise d'origine exigée), pas comme barrière de sécurité.
+  - **Pas de doublement du relais ni du bouton de réarmement.** Un second relais identique tomberait en panne de la même façon que le premier (même technologie, même appel de courant). La voie 2, d'une autre technologie, offre une meilleure redondance. Le réarmement est une fonction de **démarrage**, pas d'arrêt : sa panne ne peut pas empêcher un arrêt.
+  - **Détection de soudure du relais (logiciel, gratuit)** : si la voie 2 indique « AU enfoncé » alors que le pont diviseur lit encore « puissance présente », l'ESP32 signale « relais K1 soudé », refuse toute reprise et alerte le téléphone.
+  - **Bouton de réarmement bloqué fermé** : le relais se recollerait dès le déverrouillage de l'AU. Parade : l'ESP32 lit aussi le bouton de réarmement et se met en défaut s'il le voit appuyé en permanence. Le PWM reste à 0 tant que l'utilisateur n'a pas relancé un travail.
+  - **Clé et verrouillage à distance sur les deux voies** **[À DÉCIDER]** : dans le schéma ci-dessus, seul l'AU agit sur les deux voies. Si le relais est soudé, ouvrir la porte ou tourner la clé ne coupe plus rien. Proposition : interrupteur à clé à **2 contacts NF** (même format Ø 22 mm que l'AU) et connecteur de verrouillage à distance à **4 points** (2 boucles, double cavalier par défaut, contact de porte à 2 contacts plus tard).
+  - **Le bouton ne coupe que la bobine du relais** (quelques dizaines de mA). Son calibre continu, non indiqué par le fabricant, n'a donc pas d'importance.
+  - **Réarmement obligatoire** : déverrouiller l'arrêt d'urgence ne relance rien. Il faut appuyer sur « Réarmement » (EN ISO 13850). L'ESP32 exige ensuite une prise d'origine.
+  - **Sécurité positive** : relais collé au repos. Un fil coupé fait retomber le relais.
+  - **Interrupteur à clé** et **connecteur de verrouillage à distance** (shunté par un cavalier en l'absence de capot), demandés par l'IEC 60825-1 pour un appareil de classe 4 **[À VÉRIFIER : texte exact]**. Le connecteur permet d'ajouter plus tard un capot ou un contact de porte sans refaire le PCB.
+  - **Restent alimentés** : ESP32, écran, caméra, extraction (pour évacuer la fumée et voir ce qui se passe).
+  - Relais : bobine 24 V, contact ≥ 5 A DC **[À VÉRIFIER : courant réel du module laser, ~1 A attendu sous 24 V]**.
 - Laser **éteint par défaut** : pull-down, broche hors strapping, PWM à 0 avant tout démarrage du Wi-Fi.
 - **Watchdog** : plantage ou perte de connexion du téléphone pendant un tir → laser OFF.
 - **Détection de flamme** obligatoire, puisque le pilotage à distance implique un fonctionnement sans surveillance directe. La caméra complète cette surveillance.
-- Caisson avec fenêtre filtrante 445 nm et lunettes OD4+ adaptées à 445 nm **[À VÉRIFIER : références]**.
-- Extraction des fumées pour la découpe de contreplaqué (usage réel).
+- Lunettes certifiées **EN 207** couvrant 445 nm, OD ≥ 4 (ne pas se fier aux lunettes vertes livrées avec les modules bon marché, dont la protection réelle est souvent insuffisante) **[À VÉRIFIER : références]**. Zone de travail contrôlée : personne sans lunettes dans la pièce pendant un tir.
+- **Pas de protection de la peau nécessaire** en usage normal. Justification : l'œil concentre la lumière sur la rétine (son cristallin multiplie l'éclairement reçu par environ 100 000), alors que la peau ne concentre rien. Les seuils d'exposition admissibles sont donc bien plus élevés pour la peau : de quelques centaines à plusieurs milliers de fois selon la durée et la longueur d'onde (ordre de grandeur ANSI Z136.1 : ~200 mW/cm² pour la peau en exposition longue) **[À VÉRIFIER : valeurs exactes de la norme]**. Ordre de grandeur pour 5 W optiques : un reflet diffus sur du bois donne ~3 mW/cm² à 10 cm, très en dessous du seuil peau. Restent dangereux pour la peau : le **faisceau direct** (jamais les mains dans la zone pendant un tir) et le **reflet spéculaire** sur une surface brillante (métal poli, miroir, verre : à proscrire sans précautions).
+- **Extraction des fumées** (ventilateur 24 V sur une sortie MOSFET commandée, distincte de la pompe d'air assist) pour la découpe de contreplaqué en usage réel. Sans capot, elle aspire près de la zone de travail (hotte ou gaine), ou on travaille dans un local ventilé ou à l'extérieur.
 
 ### 6.2 Électrique
 - Entrée 24 V, fusible (≈ 5 A d'après le §4.4), anti-inversion, TVS.
@@ -334,8 +413,10 @@ Alternatives écartées :
 5. Moteurs un par un, puis prise d'origine.
 6. Sorties MOSFET pompe / LEDs / alimentation caméra, sous charge.
 7. **Laser en mode démo** : PWM vérifié à l'oscilloscope ou sur une LED. Essai de tir réel uniquement hors salle de TP, avec protections.
-8. Wi-Fi : connexion AP, latence WebSocket, flux caméra.
-9. Intégration : tracé d'un carré, coupure sur flamme simulée (briquet devant le capteur, laser simulé).
+8. Wi-Fi : connexion à la box et au partage de connexion du téléphone, bascule vers le point d'accès de configuration, latence WebSocket, flux caméra (délai d'allumage, images/s, courant caméra coupée = 0 mA).
+9. Influence du flux vidéo sur la gravure : gigue des pas avec et sans flux (contrôle, attendu nul en mode client).
+10. Chaîne de sécurité : AU enfoncé → relais retombé, laser et pompe coupés, TTL à 0, ESP32 informé ; chaque voie testée seule (relais shunté → la voie 2 bloque le TTL ; buffer forcé → la voie 1 coupe la puissance) ; temps de coupure du faisceau mesuré (photodiode ou oscilloscope) ; AU déverrouillé → rien ne redémarre avant « Réarmement » ; fil coupé → arrêt.
+11. Intégration : tracé d'un carré, coupure sur flamme simulée (briquet devant le capteur, laser simulé).
 
 ---
 
@@ -343,7 +424,7 @@ Alternatives écartées :
 | Jalon | Contenu |
 |---|---|
 | J1 | Cahier des charges figé + synoptique validé par TB/RP |
-| J2 | Proto sur cartes de dev (Wemos D1 R32 + TS35 + driver + ESP32-CAM) **pendant** la conception du schéma |
+| J2 | Proto sur DevKit ESP32-E **pendant** la conception du schéma. **Banc firmware (1 soirée)** : driver TMC2209 + 1 moteur + LED à la place du laser. FluidNC (YAML) puis Grbl_Esp32 (`notre_carte.h`), testés avec LaserGRBL en USB et Telnet (`$$`, déplacements, puissance) → choix du firmware de phase 2 et du mode de pilotage des pas **avant le routage** |
 | J3 | Schéma électrique + revue |
 | J4 | Routage + commande du PCB (fabrication ~1–2 semaines) |
 | J5 | Montage + tests unitaires |
@@ -361,7 +442,7 @@ Alternatives écartées :
 | PCB ×5 + composants | 30–60 € |
 | TMC2209 ×3 | 10–15 € |
 | Pompe d'aquarium | 10–20 € |
-| Lunettes + fenêtre filtrante | 20–40 € |
+| Lunettes OD4+ 445 nm + écran orange de tête | 20–40 € |
 | **Total** | **≈ 125–330 €** |
 
 ---
